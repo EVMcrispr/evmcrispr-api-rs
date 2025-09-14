@@ -12,11 +12,15 @@ component = "cors-proxy"
 
 [component.cors-proxy]
 source = "cors-proxy/target/wasm32-wasip1/release/cors_proxy.wasm"
-allowed_outbound_hosts = []
+allowed_outbound_hosts = ["https://*"]
 [component.cors-proxy.build]
 command = "cargo build --target wasm32-wasip1 --release"
 workdir = "cors-proxy"
 watch = ["src/**/*.rs", "Cargo.toml"]
+
+[component.cors-proxy.environment]
+ALLOWED_ORIGIN = "*"
+ALLOWED_TARGET_DOMAINS = "https://mainnet.serve.giveth.io/graphql"
 
 [[trigger.http]]
 route = "/tokenlist/..."
