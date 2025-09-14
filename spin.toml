@@ -1,0 +1,43 @@
+spin_manifest_version = 2
+
+[application]
+name = "evmcrispr-api-rs"
+version = "0.1.0"
+authors = ["Sem <931684+sembrestels@users.noreply.github.com>"]
+description = "Lightweight HTTP server for the EVMcrispr API"
+
+[[trigger.http]]
+route = "/cors-proxy/..."
+component = "cors-proxy"
+
+[component.cors-proxy]
+source = "cors-proxy/target/wasm32-wasip1/release/cors_proxy.wasm"
+allowed_outbound_hosts = []
+[component.cors-proxy.build]
+command = "cargo build --target wasm32-wasip1 --release"
+workdir = "cors-proxy"
+watch = ["src/**/*.rs", "Cargo.toml"]
+
+[[trigger.http]]
+route = "/tokenlist/..."
+component = "tokenlist"
+
+[component.tokenlist]
+source = "tokenlist/target/wasm32-wasip1/release/tokenlist.wasm"
+allowed_outbound_hosts = []
+[component.tokenlist.build]
+command = "cargo build --target wasm32-wasip1 --release"
+workdir = "tokenlist"
+watch = ["src/**/*.rs", "Cargo.toml"]
+
+[[trigger.http]]
+route = "/abi/..."
+component = "abi-fetcher"
+
+[component.abi-fetcher]
+source = "abi-fetcher/target/wasm32-wasip1/release/abi_fetcher.wasm"
+allowed_outbound_hosts = []
+[component.abi-fetcher.build]
+command = "cargo build --target wasm32-wasip1 --release"
+workdir = "abi-fetcher"
+watch = ["src/**/*.rs", "Cargo.toml"]

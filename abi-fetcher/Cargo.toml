@@ -1,0 +1,16 @@
+[package]
+name = "abi-fetcher"
+authors = ["Sem <931684+sembrestels@users.noreply.github.com>"]
+description = "API to fetch ABIs from Etherscan and other sources"
+version = "0.1.0"
+rust-version = "1.78"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+spin-sdk = "3.1.0"
+
+[workspace]
