@@ -19,7 +19,7 @@ workdir = "cors-proxy"
 watch = ["src/**/*.rs", "Cargo.toml"]
 
 [component.cors-proxy.environment]
-ALLOWED_ORIGIN = "*"
+ALLOWED_ORIGINS = "*"
 ALLOWED_TARGET_DOMAINS = "https://mainnet.serve.giveth.io/graphql"
 
 [[trigger.http]]

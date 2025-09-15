@@ -13,5 +13,6 @@ crate-type = ["cdylib"]
 anyhow = "1"
 spin-contrib-http = "0.0.9"
 spin-sdk = "5.0.0"
+futures = "0.3"
 
 [workspace]
