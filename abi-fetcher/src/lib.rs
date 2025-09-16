@@ -1,13 +1,116 @@
-use spin_sdk::http::{IntoResponse, Request, Response};
+use spin_sdk::http::{IntoResponse, Params, Request, Response, Router};
 use spin_sdk::http_component;
+use spin_sdk::variables;
+mod model;
+use model::EtherscanAbiResponse;
 
-/// A simple Spin HTTP component.
 #[http_component]
 fn handle_abi_fetcher(req: Request) -> anyhow::Result<impl IntoResponse> {
-    println!("Handling request to {:?}", req.header("spin-full-url"));
+    let mut router = Router::new();
+    router.get_async("/abi/:chainId/:contractAddress", get_abi);
+    Ok(router.handle(req))
+}
+
+async fn get_abi(_req: Request, params: Params) -> anyhow::Result<impl IntoResponse> {
+    let chain_id = params.get("chainId").unwrap_or("");
+    let address = params.get("contractAddress").unwrap_or("");
+
+    if !is_valid_address(address) || !is_valid_chain_id(chain_id) {
+        return Ok(Response::builder()
+            .status(400)
+            .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
+            .body(format!("{{\"error\":\"invalid address or chain id\",\"address\":\"{}\",\"chainId\":\"{}\"}}", address, chain_id))
+            .build());
+    }
+
+    let base_url = "https://api.etherscan.io/v2/api";
+    let api_key = variables::get("etherscan_api_key").ok();
+    // let api_key = std::env::var("ETHERSCAN_API_KEY").ok();
+    let url = format!(
+        "{base_url}?chainId={chain_id}&module=contract&action=getabi&address={address}{}",
+        api_key
+            .as_ref()
+            .map(|k| 
+                format!("&apikey={}", k.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>())
+            )
+            .unwrap_or_default()
+    );
+    println!("URL: {}", url);
+
+    let resp: Response = match spin_sdk::http::send(Request::get(url)).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(502)
+                .header("content-type", "application/json")
+                .header("access-control-allow-origin", "*")
+                .body(format!("{{\"error\":\"upstream request failed\",\"details\":\"{}\"}}", sanitize_err(e)))
+                .build());
+        }
+    };
+
+    let api_resp: EtherscanAbiResponse = match serde_json::from_slice(resp.body()) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(502)
+                .header("content-type", "application/json")
+                .header("access-control-allow-origin", "*")
+                .body(format!("{{\"error\":\"invalid upstream json\",\"details\":\"{}\"}}", sanitize_err(e)))
+                .build());
+        }
+    };
+
+    if api_resp.status != "1" {
+        return Ok(Response::builder()
+            .status(404)
+            .header("content-type", "application/json")
+            .header("access-control-allow-origin", "*")
+            .body(serde_json::json!({
+                "error": api_resp.message,
+                "chainId": chain_id,
+                "address": address,
+            }).to_string())
+            .build());
+    }
+
+    let abi_value: serde_json::Value = match serde_json::from_str(&api_resp.result) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(Response::builder()
+                .status(502)
+                .header("content-type", "application/json")
+                .header("access-control-allow-origin", "*")
+                .body(format!("{{\"error\":\"invalid abi json\",\"details\":\"{}\"}}", sanitize_err(e)))
+                .build());
+        }
+    };
+
+    let body = serde_json::json!(abi_value);
+
     Ok(Response::builder()
         .status(200)
-        .header("content-type", "text/plain")
-        .body("Hello World!")
+        .header("content-type", "application/json")
+        .header("access-control-allow-origin", "*")
+        .body(body.to_string())
         .build())
+}
+
+fn is_valid_address(addr: &str) -> bool {
+    let is_prefixed = addr.starts_with("0x") && addr.len() == 42;
+    let hex_ok = addr
+        .trim_start_matches("0x")
+        .chars()
+        .all(|c| matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F'));
+    is_prefixed && hex_ok
+}
+
+fn is_valid_chain_id(chain_id: &str) -> bool {
+    chain_id.parse::<u64>().is_ok()
+}
+
+fn sanitize_err<E: std::fmt::Display>(e: E) -> String {
+    let s = e.to_string();
+    s.chars().filter(|c| *c != '"' && *c != '\n' && *c != '\r').collect()
 }
