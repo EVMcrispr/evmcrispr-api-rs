@@ -3,6 +3,7 @@ use spin_sdk::http_component;
 use spin_sdk::variables;
 mod model;
 use model::EtherscanAbiResponse;
+use serde_json::json;
 
 #[http_component]
 fn handle_abi_fetcher(req: Request) -> anyhow::Result<impl IntoResponse> {
@@ -16,12 +17,11 @@ async fn get_abi(_req: Request, params: Params) -> anyhow::Result<impl IntoRespo
     let address = params.get("contractAddress").unwrap_or("");
 
     if !is_valid_address(address) || !is_valid_chain_id(chain_id) {
-        return Ok(Response::builder()
-            .status(400)
-            .header("content-type", "application/json")
-            .header("access-control-allow-origin", "*")
-            .body(format!("{{\"error\":\"invalid address or chain id\",\"address\":\"{}\",\"chainId\":\"{}\"}}", address, chain_id))
-            .build());
+        return Ok(build_response(400, json!({
+            "error": "invalid address or chain id",
+            "chainId": chain_id,
+            "address": address,
+        })));
     }
 
     let base_url = "https://api.etherscan.io/v2/api";
@@ -41,60 +41,51 @@ async fn get_abi(_req: Request, params: Params) -> anyhow::Result<impl IntoRespo
     let resp: Response = match spin_sdk::http::send(Request::get(url)).await {
         Ok(r) => r,
         Err(e) => {
-            return Ok(Response::builder()
-                .status(502)
-                .header("content-type", "application/json")
-                .header("access-control-allow-origin", "*")
-                .body(format!("{{\"error\":\"upstream request failed\",\"details\":\"{}\"}}", sanitize_err(e)))
-                .build());
+            return Ok(build_response(502, json!({
+                "error": "upstream request failed",
+                "details": sanitize_err(e),
+            })));
         }
     };
 
     let api_resp: EtherscanAbiResponse = match serde_json::from_slice(resp.body()) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(Response::builder()
-                .status(502)
-                .header("content-type", "application/json")
-                .header("access-control-allow-origin", "*")
-                .body(format!("{{\"error\":\"invalid upstream json\",\"details\":\"{}\"}}", sanitize_err(e)))
-                .build());
+            return Ok(build_response(502, json!({
+                "error": "invalid upstream json",
+                "details": sanitize_err(e),
+            })));
         }
     };
 
     if api_resp.status != "1" {
-        return Ok(Response::builder()
-            .status(404)
-            .header("content-type", "application/json")
-            .header("access-control-allow-origin", "*")
-            .body(serde_json::json!({
-                "error": api_resp.message,
-                "chainId": chain_id,
-                "address": address,
-            }).to_string())
-            .build());
+        return Ok(build_response(404, json!({
+            "error": api_resp.message,
+            "chainId": chain_id,
+            "address": address,
+        })));
     }
 
     let abi_value: serde_json::Value = match serde_json::from_str(&api_resp.result) {
         Ok(v) => v,
         Err(e) => {
-            return Ok(Response::builder()
-                .status(502)
-                .header("content-type", "application/json")
-                .header("access-control-allow-origin", "*")
-                .body(format!("{{\"error\":\"invalid abi json\",\"details\":\"{}\"}}", sanitize_err(e)))
-                .build());
+            return Ok(build_response(502, json!({
+                "error": "invalid abi json",
+                "details": sanitize_err(e),
+            })));
         }
     };
 
-    let body = serde_json::json!(abi_value);
+    Ok(build_response(200, abi_value))
+}
 
-    Ok(Response::builder()
-        .status(200)
+fn build_response(status: u16, body: serde_json::Value) -> Response {
+    Response::builder()
+        .status(status)
         .header("content-type", "application/json")
         .header("access-control-allow-origin", "*")
         .body(body.to_string())
-        .build())
+        .build()
 }
 
 fn is_valid_address(addr: &str) -> bool {
