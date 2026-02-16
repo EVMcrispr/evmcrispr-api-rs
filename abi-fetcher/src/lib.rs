@@ -61,6 +61,7 @@ async fn get_abi(_req: Request, params: Params) -> anyhow::Result<impl IntoRespo
     if api_resp.status != "1" {
         return Ok(build_response(404, json!({
             "error": api_resp.message,
+            "details": api_resp.result,
             "chainId": chain_id,
             "address": address,
         })));
