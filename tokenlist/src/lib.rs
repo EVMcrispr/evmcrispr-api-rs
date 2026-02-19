@@ -54,14 +54,15 @@ async fn get_token_list(_req: Request, params: Params) -> anyhow::Result<impl In
 
     match build_and_cache_token_list(&store, chain_id, &response_cache_key).await {
         Ok(resp) => Ok(resp),
-        Err(_) => {
+        Err(e) => {
+            eprintln!("build_and_cache_token_list failed: {e:#}");
             if let Some(stale) = cache::get_stale::<TokenListResponse>(&store, &response_cache_key)
             {
                 Ok(build_response(200, &stale))
             } else {
                 Ok(build_response(
                     502,
-                    &json!({ "error": "failed to fetch token lists and no cache available" }),
+                    &json!({ "error": format!("failed to fetch token lists: {e:#}") }),
                 ))
             }
         }
@@ -263,11 +264,19 @@ async fn fetch_with_cache(
 }
 
 async fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
-    let resp: Response = spin_sdk::http::send(Request::get(url)).await?;
-    if *resp.status() != 200u16 {
-        anyhow::bail!("HTTP {} from {url}", resp.status());
+    let req = Request::builder()
+        .method(spin_sdk::http::Method::Get)
+        .uri(url)
+        .header("user-agent", "evmcrispr-api/0.1 (+https://evmcrispr.com)")
+        .build();
+    let resp: Response = spin_sdk::http::send(req).await?;
+    let status = *resp.status();
+    if status != 200u16 {
+        let body_preview = String::from_utf8_lossy(&resp.body()[..resp.body().len().min(500)]);
+        anyhow::bail!("HTTP {status} from {url}: {body_preview}");
     }
-    Ok(serde_json::from_slice(resp.body())?)
+    serde_json::from_slice(resp.body())
+        .map_err(|e| anyhow::anyhow!("JSON parse error for {url}: {e}"))
 }
 
 fn build_response(status: u16, body: &impl serde::Serialize) -> Response {
