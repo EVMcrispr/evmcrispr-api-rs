@@ -28,7 +28,8 @@ component = "tokenlist"
 
 [component.tokenlist]
 source = "tokenlist/target/wasm32-wasip1/release/tokenlist.wasm"
-allowed_outbound_hosts = []
+allowed_outbound_hosts = ["https://api.coingecko.com", "https://tokens.coingecko.com", "https://raw.githubusercontent.com"]
+key_value_stores = ["default"]
 [component.tokenlist.build]
 command = "cargo build --target wasm32-wasip1 --release"
 workdir = "tokenlist"
@@ -41,6 +42,7 @@ component = "abi-fetcher"
 [component.abi-fetcher]
 source = "abi-fetcher/target/wasm32-wasip1/release/abi_fetcher.wasm"
 allowed_outbound_hosts = ["https://api.etherscan.io"]
+key_value_stores = ["default"]
 [component.abi-fetcher.build]
 command = "cargo build --target wasm32-wasip1 --release"
 workdir = "abi-fetcher"
