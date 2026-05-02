@@ -202,10 +202,10 @@ fn get_allowed_targets() -> Vec<String> {
         .collect::<Vec<String>>()
 }
 
-/// Check if the target is allowed
+/// Check if the target is allowed (prefix match against the allowlist)
 fn is_target_allowed(target: &str) -> bool {
     let allowed_targets = get_allowed_targets();
-    allowed_targets.len() == 0 || allowed_targets.contains(&target.to_string())
+    allowed_targets.is_empty() || allowed_targets.iter().any(|a| target.starts_with(a))
 }
 
 /// Handle error (appending CORS headers)
