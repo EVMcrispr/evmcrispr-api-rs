@@ -41,7 +41,14 @@ component = "abi-fetcher"
 
 [component.abi-fetcher]
 source = "abi-fetcher/target/wasm32-wasip1/release/abi_fetcher.wasm"
-allowed_outbound_hosts = ["https://api.etherscan.io"]
+allowed_outbound_hosts = [
+    "https://api.etherscan.io",
+    "https://eth.blockscout.com",
+    "https://optimism.blockscout.com",
+    "https://gnosis.blockscout.com",
+    "https://arbitrum.blockscout.com",
+    "https://base.blockscout.com",
+]
 key_value_stores = ["default"]
 [component.abi-fetcher.build]
 command = "cargo build --target wasm32-wasip1 --release"
