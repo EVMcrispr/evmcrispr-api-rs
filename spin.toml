@@ -20,7 +20,7 @@ watch = ["src/**/*.rs", "Cargo.toml"]
 
 [component.cors-proxy.environment]
 ALLOWED_ORIGINS = "*"
-ALLOWED_TARGET_DOMAINS = "https://mainnet.serve.giveth.io/graphql"
+ALLOWED_TARGET_DOMAINS = "https://mainnet.serve.giveth.io/graphql,https://auth.giveth.io/v1"
 
 [[trigger.http]]
 route = "/tokenlist/..."

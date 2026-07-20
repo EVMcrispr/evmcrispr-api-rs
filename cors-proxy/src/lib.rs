@@ -28,6 +28,14 @@ async fn cors_proxy(req: IncomingRequest, res_out: ResponseOutparam) {
         .map(|(_, v)| String::from_utf8(v.to_vec()).unwrap())
         .unwrap_or_default();
 
+    // Preflight requests are between the browser and the proxy: answer them
+    // here instead of forwarding OPTIONS upstream (which browsers never asked
+    // for and upstreams may not handle).
+    if matches!(method_for_req, spin_sdk::http::Method::Options) {
+        handle_error(res_out, 204, "", &method_for_req, origin_for_req).await;
+        return;
+    }
+
     let target = match get_target(&req) {
         Some(t) => t,
         None => {
@@ -61,11 +69,19 @@ async fn cors_proxy(req: IncomingRequest, res_out: ResponseOutparam) {
 
     println!("Target: {}", target);
 
+    // Forward the request without browser-context headers: `host` belongs to
+    // the proxy, and `origin`/`referer` would make CORS-aware upstreams emit
+    // their own Access-Control-* headers on top of ours.
+    let forward_headers = headers_for_req
+        .into_iter()
+        .filter(|(k, _)| !matches!(k.to_ascii_lowercase().as_str(), "host" | "origin" | "referer"))
+        .collect::<Vec<(String, Vec<u8>)>>();
+
     // Stream the incoming body to the outgoing request and get upstream response
     let upstream: IncomingResponse = match send_upstream_streaming(
         method_for_req.clone(),
         &target,
-        headers_for_req,
+        forward_headers,
         req,
     )
     .await
@@ -84,11 +100,14 @@ async fn cors_proxy(req: IncomingRequest, res_out: ResponseOutparam) {
         }
     };
 
-    // Prepare a streaming response to the client
+    // Prepare a streaming response to the client, dropping any CORS headers
+    // the upstream set: ours are appended below, and duplicated
+    // Access-Control-* headers make browsers reject the response.
     let mut headers = upstream
         .headers()
         .entries()
         .into_iter()
+        .filter(|(k, _)| !k.to_ascii_lowercase().starts_with("access-control-"))
         .collect::<Vec<(String, Vec<u8>)>>();
 
     // Add your CORS headers here if needed (use request Origin)
@@ -121,14 +140,21 @@ async fn send_upstream_streaming(
     let mut body_sink = outgoing_req.take_body();
     let send_fut = spin_sdk::http::send(outgoing_req);
 
-    let mut in_stream = req.into_body_stream();
-    while let Some(chunk) = in_stream.next().await {
-        body_sink.send(chunk?).await?;
-    }
-    body_sink.flush().await?;
-    body_sink.close().await?;
+    // Drive the upstream send and the body copy concurrently: the sink only
+    // drains while the send future is polled, so awaiting the copy first
+    // deadlocks on any request with a body.
+    let copy_fut = async move {
+        let mut in_stream = req.into_body_stream();
+        while let Some(chunk) = in_stream.next().await {
+            body_sink.send(chunk?).await?;
+        }
+        body_sink.flush().await?;
+        body_sink.close().await?;
+        anyhow::Ok(())
+    };
+    let (upstream, _copied) = futures::join!(send_fut, copy_fut);
 
-    Ok(send_fut.await?)
+    Ok(upstream?)
 }
 
 /// Append CORS headers to the provided response header list using
