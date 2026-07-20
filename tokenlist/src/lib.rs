@@ -7,12 +7,10 @@ use spin_sdk::key_value::Store;
 mod cache;
 mod model;
 
-use model::{AssetPlatform, SourceTokenList, Token, TokenListResponse, Version};
+use model::{AssetPlatform, SourceTokenList, TokenListResponse, Version};
 
 const TOKEN_LIST_TTL_MS: u64 = 12 * 60 * 60 * 1000; // 12 hours
 const PLATFORMS_TTL_MS: u64 = 5 * 24 * 60 * 60 * 1000; // 5 days
-const SUPERFLUID_URL: &str =
-    "https://raw.githubusercontent.com/superfluid-finance/tokenlist/main/superfluid.extended.tokenlist.json";
 
 #[http_component]
 fn handle_tokenlist(req: Request) -> anyhow::Result<impl IntoResponse> {
@@ -77,46 +75,20 @@ async fn build_and_cache_token_list(
     let (network_name, network_id) = resolve_network(store, chain_id).await?;
 
     let coingecko_cache_key = format!("coingecko_{network_id}");
-    let superfluid_cache_key = "superfluid";
-
     let coingecko_url = format!("https://tokens.coingecko.com/{network_id}/all.json");
-    let (coingecko_result, superfluid_result) = futures::join!(
-        fetch_with_cache(store, &coingecko_url, &coingecko_cache_key),
-        fetch_with_cache(store, SUPERFLUID_URL, superfluid_cache_key),
-    );
+    let coingecko_data = fetch_with_cache(store, &coingecko_url, &coingecko_cache_key).await?;
 
-    let coingecko_data = coingecko_result?;
-    let superfluid_data = superfluid_result?;
-
-    let last_timestamp = [&coingecko_data.timestamp, &superfluid_data.timestamp]
-        .iter()
-        .filter_map(|t| t.as_deref())
-        .filter_map(|t| parse_timestamp(t))
-        .max()
+    let last_timestamp = coingecko_data
+        .timestamp
+        .as_deref()
+        .and_then(parse_timestamp)
         .unwrap_or(0);
-
-    let superfluid_filtered: Vec<Token> = superfluid_data
-        .tokens
-        .into_iter()
-        .filter(|t| t.chain_id == chain_id)
-        .collect();
-
-    let mut tokens = coingecko_data.tokens;
-    let mut seen: std::collections::HashSet<String> =
-        tokens.iter().map(|t| t.address.to_lowercase()).collect();
-
-    for token in superfluid_filtered {
-        let addr_lower = token.address.to_lowercase();
-        if !addr_lower.is_empty() && seen.insert(addr_lower) {
-            tokens.push(token);
-        }
-    }
 
     let token_list = TokenListResponse {
         name: format!("EVMcrispr Token List ({network_name})"),
         logo_uri: "https://evmcrispr.com/favicon.ico".to_string(),
         timestamp: timestamp_to_iso(last_timestamp),
-        tokens,
+        tokens: coingecko_data.tokens,
         version: Version {
             major: 1,
             minor: 0,
@@ -146,47 +118,24 @@ async fn build_token_list_without_cache(chain_id: u64) -> Response {
     let (network_name, network_id) = network;
     let coingecko_url = format!("https://tokens.coingecko.com/{network_id}/all.json");
 
-    let (cg, sf) = futures::join!(
-        fetch_json::<SourceTokenList>(&coingecko_url),
-        fetch_json::<SourceTokenList>(SUPERFLUID_URL),
-    );
+    let coingecko_data = fetch_json::<SourceTokenList>(&coingecko_url)
+        .await
+        .unwrap_or_else(|_| SourceTokenList {
+            tokens: vec![],
+            timestamp: None,
+        });
 
-    let coingecko_data = cg.unwrap_or_else(|_| SourceTokenList {
-        tokens: vec![],
-        timestamp: None,
-    });
-    let superfluid_data = sf.unwrap_or_else(|_| SourceTokenList {
-        tokens: vec![],
-        timestamp: None,
-    });
-
-    let last_timestamp = [&coingecko_data.timestamp, &superfluid_data.timestamp]
-        .iter()
-        .filter_map(|t| t.as_deref())
-        .filter_map(|t| parse_timestamp(t))
-        .max()
+    let last_timestamp = coingecko_data
+        .timestamp
+        .as_deref()
+        .and_then(parse_timestamp)
         .unwrap_or(0);
-
-    let superfluid_filtered: Vec<Token> = superfluid_data
-        .tokens
-        .into_iter()
-        .filter(|t| t.chain_id == chain_id)
-        .collect();
-    let mut tokens = coingecko_data.tokens;
-    let mut seen: std::collections::HashSet<String> =
-        tokens.iter().map(|t| t.address.to_lowercase()).collect();
-    for token in superfluid_filtered {
-        let addr_lower = token.address.to_lowercase();
-        if !addr_lower.is_empty() && seen.insert(addr_lower) {
-            tokens.push(token);
-        }
-    }
 
     let token_list = TokenListResponse {
         name: format!("EVMcrispr Token List ({network_name})"),
         logo_uri: "https://evmcrispr.com/favicon.ico".to_string(),
         timestamp: timestamp_to_iso(last_timestamp),
-        tokens,
+        tokens: coingecko_data.tokens,
         version: Version {
             major: 1,
             minor: 0,
