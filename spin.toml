@@ -55,8 +55,39 @@ command = "cargo build --target wasm32-wasip1 --release"
 workdir = "abi-fetcher"
 watch = ["src/**/*.rs", "Cargo.toml"]
 
+[[trigger.http]]
+route = "/search"
+component = "tavily-search"
+
+[component.tavily-search]
+source = "tavily-search/target/wasm32-wasip1/release/tavily_search.wasm"
+allowed_outbound_hosts = ["https://api.tavily.com"]
+[component.tavily-search.build]
+command = "cargo build --target wasm32-wasip1 --release"
+workdir = "tavily-search"
+watch = ["src/**/*.rs", "Cargo.toml"]
+
+[[trigger.http]]
+route = "/fetch/..."
+component = "fetch-proxy"
+
+[component.fetch-proxy]
+source = "fetch-proxy/target/wasm32-wasip1/release/fetch_proxy.wasm"
+allowed_outbound_hosts = ["https://*"]
+[component.fetch-proxy.build]
+command = "cargo build --target wasm32-wasip1 --release"
+workdir = "fetch-proxy"
+watch = ["src/**/*.rs", "Cargo.toml"]
+
+[component.fetch-proxy.environment]
+ALLOWED_ORIGINS = "*"
+
 [variables]
 etherscan_api_key = { required = true }
+tavily_api_key = { required = true }
+
+[component.tavily-search.variables]
+tavily_api_key = "{{ tavily_api_key }}"
 
 [component.abi-fetcher.variables]
 etherscan_api_key = "{{ etherscan_api_key }}"
