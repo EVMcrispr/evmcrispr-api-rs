@@ -28,7 +28,7 @@ watch = ["src/**/*.rs", "Cargo.toml"]
 
 [component.cors-proxy.environment]
 ALLOWED_ORIGINS = "*"
-ALLOWED_TARGET_DOMAINS = "https://mainnet.serve.giveth.io/graphql,https://auth.giveth.io/v1,http://91.134.73.215:8545,http://65.109.26.16:18688,http://65.109.26.16:18999,http://65.109.26.16:18998"
+ALLOWED_TARGET_DOMAINS = "https://mainnet.serve.giveth.io/graphql,https://auth.giveth.io/v1,https://api.gelato.digital/automate/users/users/web3-function,https://api.gelato.digital/1balance,http://91.134.73.215:8545,http://65.109.26.16:18688,http://65.109.26.16:18999,http://65.109.26.16:18998"
 
 [[trigger.http]]
 route = "/tokenlist/..."
