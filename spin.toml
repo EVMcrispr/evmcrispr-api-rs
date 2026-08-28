@@ -79,6 +79,28 @@ command = "cargo build --target wasm32-wasip1 --release"
 workdir = "tavily-search"
 watch = ["src/**/*.rs", "Cargo.toml"]
 
+[[trigger.http]]
+route = "/experimental-eez-rpc/..."
+component = "experimental-eez-rpc"
+
+[component.experimental-eez-rpc]
+source = "experimental-eez-rpc/target/wasm32-wasip1/release/experimental_eez_rpc.wasm"
+# EEZ devnet execution RPCs and cross-chain fronts (plain http).
+allowed_outbound_hosts = [
+    "http://91.134.73.215:8545",
+    "http://65.109.26.16:18688",
+    "http://65.109.26.16:18999",
+    "http://65.109.26.16:18998",
+]
+[component.experimental-eez-rpc.build]
+command = "cargo build --target wasm32-wasip1 --release"
+workdir = "experimental-eez-rpc"
+watch = ["src/**/*.rs", "Cargo.toml"]
+
+[component.experimental-eez-rpc.environment]
+# key=chainId,executionRpc,front;...
+EEZ_CHAINS = "eezL1=7331,http://91.134.73.215:8545,http://65.109.26.16:18999;eezL2=6290,http://65.109.26.16:18688,http://65.109.26.16:18998"
+
 [variables]
 etherscan_api_key = { required = true }
 tavily_api_key = { required = true }
