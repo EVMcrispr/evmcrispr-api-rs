@@ -12,7 +12,15 @@ component = "cors-proxy"
 
 [component.cors-proxy]
 source = "cors-proxy/target/wasm32-wasip1/release/cors_proxy.wasm"
-allowed_outbound_hosts = ["https://*"]
+allowed_outbound_hosts = [
+    "https://*",
+    # EEZ (Ethereum Economic Zone) hosted devnet: plain-http RPCs and
+    # cross-chain ingress fronts, proxied so browsers and wallets can use them.
+    "http://91.134.73.215:8545",
+    "http://65.109.26.16:18688",
+    "http://65.109.26.16:18999",
+    "http://65.109.26.16:18998",
+]
 [component.cors-proxy.build]
 command = "cargo build --target wasm32-wasip1 --release"
 workdir = "cors-proxy"
@@ -20,7 +28,7 @@ watch = ["src/**/*.rs", "Cargo.toml"]
 
 [component.cors-proxy.environment]
 ALLOWED_ORIGINS = "*"
-ALLOWED_TARGET_DOMAINS = "https://mainnet.serve.giveth.io/graphql,https://auth.giveth.io/v1"
+ALLOWED_TARGET_DOMAINS = "https://mainnet.serve.giveth.io/graphql,https://auth.giveth.io/v1,http://91.134.73.215:8545,http://65.109.26.16:18688,http://65.109.26.16:18999,http://65.109.26.16:18998"
 
 [[trigger.http]]
 route = "/tokenlist/..."
