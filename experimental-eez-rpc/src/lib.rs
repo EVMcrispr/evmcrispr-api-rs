@@ -35,6 +35,15 @@ const CALL_WRAPPERS: [(&str, usize, usize); 3] = [
 /// How many wrappers to peel before giving up: each costs one `eth_call`.
 const MAX_UNWRAP_DEPTH: u8 = 3;
 
+/// Safe `execTransaction(address to, uint256 value, bytes data, uint8
+/// operation, …)`. A Safe reverts a failed inner call with a bare `GS013`,
+/// dropping its reason, so a cross-chain call made through a Safe is only
+/// recognisable by replaying the inner call from the Safe itself.
+const SAFE_EXEC_TRANSACTION: &str = "0x6a761202";
+/// `multiSend(bytes transactions)` of Safe's MultiSend / MultiSendCallOnly:
+/// what a Safe delegatecalls to make several calls in one transaction.
+const MULTI_SEND: &str = "0x8d80ff0a";
+
 const CORS_HEADERS: [(&str, &str); 4] = [
     ("access-control-allow-origin", "*"),
     ("access-control-allow-methods", "GET, POST, OPTIONS"),
@@ -81,7 +90,8 @@ fn chains() -> Vec<(String, Chain)> {
 ///   up with the execution RPC); everything else → execution RPC verbatim.
 ///
 /// Either revert also counts when it arrives wrapped in a caller's own error
-/// (see `CALL_WRAPPERS`), which is unwrapped and replayed to find out.
+/// (see `CALL_WRAPPERS`), or hidden behind a Safe's `execTransaction` (see
+/// `SAFE_EXEC_TRANSACTION`): the wrapped call is replayed to find out.
 #[http_component]
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     if matches!(req.method(), Method::Options) {
@@ -149,12 +159,12 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
 }
 
 async fn estimate_gas(chain: &Chain, id: Value, parsed: &Value, body: Vec<u8>) -> Response {
-    let from = parsed["params"][0]["from"].as_str().unwrap_or_default();
+    let call = &parsed["params"][0];
     let upstream = match rpc_post(&chain.execution_rpc, body).await {
         Ok(r) => r,
         Err(e) => return rpc_error(id, -32603, &format!("execution RPC unreachable: {e}")),
     };
-    if is_cross_chain(chain, from, &upstream, 0).await {
+    if is_cross_chain(chain, call, &upstream, 0).await {
         println!(
             "[{}] eth_estimateGas: cross-chain call, answering {CROSS_CHAIN_GAS}",
             chain.chain_id
@@ -185,8 +195,7 @@ async fn send_raw_transaction(chain: &Chain, id: Value, parsed: &Value, body: Ve
         Ok(r) => r,
         Err(e) => return rpc_error(id, -32603, &format!("execution RPC unreachable: {e}")),
     };
-    let from = call["from"].as_str().unwrap_or_default();
-    if !is_cross_chain(chain, from, &sim_resp, 0).await {
+    if !is_cross_chain(chain, &call, &sim_resp, 0).await {
         println!(
             "[{}] eth_sendRawTransaction: ordinary tx from {}, forwarding to execution RPC",
             chain.chain_id, call["from"]
@@ -300,12 +309,14 @@ fn revert_data(resp: &Value) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-/// Whether a probe reverted because the call is cross-chain: either
-/// `ExecutionNotFound()` itself, or a wrapper around a call that reverts with
-/// it. A wrapper keeps only the target and the calldata, so the wrapped call
-/// is replayed against the execution RPC to see what it really reverts with —
-/// up to `MAX_UNWRAP_DEPTH` layers, since wrappers nest.
-async fn is_cross_chain(chain: &Chain, from: &str, resp: &Value, depth: u8) -> bool {
+/// Whether `call` (an `eth_call` params object) reverted with `resp` because
+/// it is cross-chain: `ExecutionNotFound()` itself, a wrapper around a call
+/// that reverts with it, or a Safe `execTransaction` whose inner call does.
+/// A wrapper keeps only the target and the calldata, and a Safe keeps
+/// nothing at all, so the inner call is replayed against the execution RPC
+/// to see what it really reverts with — up to `MAX_UNWRAP_DEPTH` layers,
+/// since wrappers nest.
+async fn is_cross_chain(chain: &Chain, call: &Value, resp: &Value, depth: u8) -> bool {
     let Some(data) = revert_data(resp) else {
         return false;
     };
@@ -319,25 +330,133 @@ async fn is_cross_chain(chain: &Chain, from: &str, resp: &Value, depth: u8) -> b
         );
         return false;
     }
-    let Some((target, inner)) = unwrap_call(&data) else {
-        return false;
+    let from = call["from"].as_str().unwrap_or_default();
+    let inner_calls = if let Some((target, inner)) = unwrap_call(&data) {
+        println!(
+            "[{}] revert wraps a call to {target}, replaying it to see why it failed",
+            chain.chain_id
+        );
+        vec![json!({"from": from, "to": target, "data": inner})]
+    } else {
+        let calls = safe_inner_calls(call);
+        if !calls.is_empty() {
+            println!(
+                "[{}] revert comes from a Safe transaction, replaying its {} inner call(s) from the Safe",
+                chain.chain_id,
+                calls.len()
+            );
+        }
+        calls
     };
-    println!(
-        "[{}] revert wraps a call to {target}, replaying it to see why it failed",
-        chain.chain_id
-    );
-    let probe = json!({
-        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-        "params": [{"from": from, "to": target, "data": inner}, "latest"],
-    });
-    match rpc_json(&chain.execution_rpc, &probe).await {
-        // Boxed because the recursion makes this future's size unbounded.
-        Ok(inner_resp) => Box::pin(is_cross_chain(chain, from, &inner_resp, depth + 1)).await,
-        Err(e) => {
-            println!("[{}] replay of {target} failed: {e}", chain.chain_id);
-            false
+    for inner in inner_calls {
+        let probe = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+            "params": [inner, "latest"],
+        });
+        match rpc_json(&chain.execution_rpc, &probe).await {
+            // Boxed because the recursion makes this future's size unbounded.
+            Ok(inner_resp) => {
+                if Box::pin(is_cross_chain(chain, &inner, &inner_resp, depth + 1)).await {
+                    return true;
+                }
+            }
+            Err(e) => {
+                println!("[{}] replay of {} failed: {e}", chain.chain_id, inner["to"]);
+            }
         }
     }
+    false
+}
+
+/// The calls a Safe makes for an `execTransaction` calldata, as `eth_call`
+/// params from the Safe's own address: the inner call itself, or — when it
+/// delegatecalls a MultiSend — each packed call. Empty when `call` is not a
+/// Safe transaction we can replay (a delegatecall to anything else has no
+/// stand-alone equivalent).
+fn safe_inner_calls(call: &Value) -> Vec<Value> {
+    let (Some(safe), Some(data)) = (call["to"].as_str(), call["data"].as_str()) else {
+        return vec![];
+    };
+    let Some((to, value, inner, operation)) = decode_exec_transaction(data) else {
+        return vec![];
+    };
+    let as_call = |to: &str, value: &str, data: &str| json!({"from": safe, "to": to, "data": data, "value": value});
+    match operation {
+        0 => vec![as_call(&to, &value, &inner)],
+        1 => decode_multi_send(&inner)
+            .into_iter()
+            .filter(|(op, _, _, _)| *op == 0)
+            .map(|(_, to, value, data)| as_call(&to, &value, &data))
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// `(to, value, data, operation)` of a Safe `execTransaction` calldata.
+fn decode_exec_transaction(data: &str) -> Option<(String, String, String, u8)> {
+    let bytes = hex::decode(data.trim_start_matches("0x")).ok()?;
+    if hex::encode_prefixed(bytes.get(..4)?) != SAFE_EXEC_TRANSACTION {
+        return None;
+    }
+    let args = &bytes[4..];
+    let word = |i: usize| args.get(i * 32..(i + 1) * 32);
+    let to = hex::encode_prefixed(&word(0)?[12..]);
+    let value = hex_quantity(word(1)?);
+    let offset = low_u32(word(2)?)?;
+    let len = low_u32(args.get(offset..offset + 32)?)?;
+    let inner = hex::encode_prefixed(args.get(offset + 32..offset + 32 + len)?);
+    let operation = word(3)?[31];
+    Some((to, value, inner, operation))
+}
+
+/// The `(operation, to, value, data)` entries packed into a `multiSend(bytes)`
+/// calldata: each is `operation(1) ‖ to(20) ‖ value(32) ‖ length(32) ‖ data`.
+/// Empty when the calldata is not a MultiSend call or is malformed.
+fn decode_multi_send(data: &str) -> Vec<(u8, String, String, String)> {
+    let Ok(bytes) = hex::decode(data.trim_start_matches("0x")) else {
+        return vec![];
+    };
+    if bytes.get(..4).map(hex::encode_prefixed).as_deref() != Some(MULTI_SEND) {
+        return vec![];
+    }
+    let args = &bytes[4..];
+    let Some(packed) = low_u32(&args[..32.min(args.len())])
+        .and_then(|offset| low_u32(args.get(offset..offset + 32)?).map(|len| (offset, len)))
+        .and_then(|(offset, len)| args.get(offset + 32..offset + 32 + len))
+    else {
+        return vec![];
+    };
+    let mut entries = vec![];
+    let mut at = 0;
+    while at + 85 <= packed.len() {
+        let operation = packed[at];
+        let to = hex::encode_prefixed(&packed[at + 1..at + 21]);
+        let value = hex_quantity(&packed[at + 21..at + 53]);
+        let Some(len) = low_u32(&packed[at + 53..at + 85]) else {
+            break;
+        };
+        let Some(call_data) = packed.get(at + 85..at + 85 + len) else {
+            break;
+        };
+        entries.push((operation, to, value, hex::encode_prefixed(call_data)));
+        at += 85 + len;
+    }
+    entries
+}
+
+/// A 32-byte word as a JSON-RPC quantity (`0x0`, no leading zeros).
+fn hex_quantity(word: &[u8]) -> String {
+    let trimmed = hex::encode(word).trim_start_matches('0').to_string();
+    format!("0x{}", if trimmed.is_empty() { "0" } else { &trimmed })
+}
+
+/// The low 4 bytes of a word: the only part of an offset or length that can
+/// be meaningful here, the whole payload being far smaller than 4GiB.
+fn low_u32(word: &[u8]) -> Option<usize> {
+    if word.len() != 32 {
+        return None;
+    }
+    Some(u32::from_be_bytes(word[28..32].try_into().ok()?) as usize)
 }
 
 /// Pull `(target, calldata)` out of one of the `CALL_WRAPPERS` errors.
@@ -348,11 +467,6 @@ fn unwrap_call(data: &str) -> Option<(String, String)> {
     let (_, address_word, bytes_word) = CALL_WRAPPERS.iter().find(|(s, _, _)| *s == selector)?;
     let args = &bytes[4..];
     let word = |i: usize| args.get(i * 32..(i + 1) * 32);
-    // Only the low 4 bytes of an offset or length can be meaningful here: the
-    // whole payload is far smaller than 4GiB.
-    fn low_u32(word: &[u8]) -> Option<usize> {
-        Some(u32::from_be_bytes(word[28..32].try_into().ok()?) as usize)
-    }
     let target = hex::encode_prefixed(&word(*address_word)?[12..]);
     let offset = low_u32(word(*bytes_word)?)?;
     let len = low_u32(args.get(offset..offset + 32)?)?;
@@ -419,4 +533,103 @@ fn with_cors(builder: &mut ResponseBuilder) -> &mut ResponseBuilder {
         builder.header(k, v);
     }
     builder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(hex_str: &str) -> String {
+        format!("{:0>64}", hex_str.trim_start_matches("0x"))
+    }
+
+    /// `execTransaction(to, value, data, operation, 0, 0, 0, 0x0, 0x0, sig)`
+    /// with `data` and `signatures` as dynamic tails.
+    fn exec_transaction(to: &str, value: u64, data: &str, operation: u8) -> String {
+        let data_hex = data.trim_start_matches("0x");
+        let mut s = String::from("6a761202");
+        s += &word(to);
+        s += &word(&format!("{value:x}"));
+        s += &word("140"); // data offset: 10 words
+        s += &word(&format!("{operation:x}"));
+        for _ in 0..5 {
+            s += &word("0");
+        }
+        s += &word("180"); // signatures offset: after data (len word + 1 word)
+        s += &word(&format!("{:x}", data_hex.len() / 2));
+        s += &format!("{data_hex:0<64}");
+        s += &word("0"); // empty signatures
+        format!("0x{s}")
+    }
+
+    #[test]
+    fn decodes_a_plain_exec_transaction() {
+        let data = exec_transaction(
+            "0xa55e472841ca3d318205036724a94f5abdbf7b18",
+            7,
+            "0x0ce105e2",
+            0,
+        );
+        let (to, value, inner, operation) = decode_exec_transaction(&data).unwrap();
+        assert_eq!(to, "0xa55e472841ca3d318205036724a94f5abdbf7b18");
+        assert_eq!(value, "0x7");
+        assert_eq!(inner, "0x0ce105e2");
+        assert_eq!(operation, 0);
+    }
+
+    #[test]
+    fn ignores_other_selectors() {
+        assert!(decode_exec_transaction("0xdeadbeef").is_none());
+        assert!(decode_multi_send("0xdeadbeef").is_empty());
+    }
+
+    #[test]
+    fn decodes_packed_multi_send_entries() {
+        // Two entries: a call with 4 bytes of data, then a delegatecall with none.
+        let a = "1111111111111111111111111111111111111111";
+        let b = "2222222222222222222222222222222222222222";
+        let packed = format!(
+            "00{a}{}{}0ce105e201{b}{}{}",
+            word("5"),
+            word("4"),
+            word("0"),
+            word("0")
+        );
+        let data = format!(
+            "0x8d80ff0a{}{}{packed:0<128}",
+            word("20"),
+            word(&format!("{:x}", packed.len() / 2))
+        );
+        let entries = decode_multi_send(&data);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            (0, format!("0x{a}"), "0x5".into(), "0x0ce105e2".into())
+        );
+        assert_eq!(entries[1], (1, format!("0x{b}"), "0x0".into(), "0x".into()));
+    }
+
+    #[test]
+    fn replays_only_calls_from_the_safe() {
+        let a = "1111111111111111111111111111111111111111";
+        let packed = format!("00{a}{}{}0ce105e2", word("0"), word("4"));
+        let multi = format!(
+            "0x8d80ff0a{}{}{packed:0<128}",
+            word("20"),
+            word(&format!("{:x}", packed.len() / 2))
+        );
+        let call = json!({
+            "from": "0xowner",
+            "to": "0x5afe",
+            "data": exec_transaction("0x7b21bbdbde8d01df591fdc2dc0be9956dde1e16c", 0, &multi, 1),
+        });
+        let inner = safe_inner_calls(&call);
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0]["from"], "0x5afe");
+        assert_eq!(inner[0]["to"], format!("0x{a}"));
+        assert_eq!(inner[0]["data"], "0x0ce105e2");
+        // A delegatecall to something that is not a MultiSend has no replay.
+        let call = json!({"from": "0xowner", "to": "0x5afe", "data": exec_transaction("0xabcd", 0, "0x", 1)});
+        assert!(safe_inner_calls(&call).is_empty());
+    }
 }
