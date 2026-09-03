@@ -16,5 +16,10 @@ serde_json = "1"
 alloy-consensus = { version = "2", default-features = false, features = ["k256"] }
 alloy-primitives = { version = "1", default-features = false }
 alloy-rlp = "0.3"
+# For the non-blocking wait in `sleep_secs`: a wasi monotonic-clock pollable
+# registered with the same executor spin-sdk uses. Both already ship inside
+# spin-sdk; naming them here only makes them reachable.
+spin-executor = "5"
+wasi = "0.13"
 
 [workspace]

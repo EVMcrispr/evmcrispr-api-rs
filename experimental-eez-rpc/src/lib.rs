@@ -3,8 +3,12 @@ use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_primitives::hex;
 use alloy_rlp::Decodable;
 use serde_json::{json, Value};
+use spin_executor::CancelOnDropToken;
 use spin_sdk::http::{IntoResponse, Method, Request, Response, ResponseBuilder};
 use spin_sdk::http_component;
+use std::future;
+use std::task::Poll;
+use wasi::clocks::monotonic_clock;
 
 /// Selector of the EEZ registry's `ExecutionNotFound()` error: what a
 /// cross-chain call reverts with when run outside a composed sync block.
@@ -218,9 +222,39 @@ async fn wait_for_front_sync(chain: &Chain) -> anyhow::Result<()> {
             "[{}] front at block {front} < execution {target}, waiting",
             chain.chain_id
         );
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        sleep_secs(1).await;
         waited += 1;
     }
+}
+
+/// Wait `secs` without blocking the component instance.
+///
+/// `std::thread::sleep` would stall the whole instance instead of yielding to
+/// the executor: on Fermyon Cloud a request parked that way holds its slot and
+/// its outbound connection for the entire wait, and enough of them exhaust the
+/// app's connection allowance — every later request then traps with
+/// `ErrorCode::ConnectionLimitReached`, including ones that never route
+/// cross-chain.
+async fn sleep_secs(secs: u64) {
+    let deadline = monotonic_clock::now() + secs * 1_000_000_000;
+    // Owned by the closure purely to hold the subscription: assigning a new
+    // token drops the previous one, which cancels it, so re-subscribing on
+    // every poll cannot pile pollables up in the executor's waker list.
+    let mut _token = None;
+    future::poll_fn(move |context| {
+        if monotonic_clock::now() >= deadline {
+            Poll::Ready(())
+        } else {
+            _token = Some(CancelOnDropToken::from(
+                spin_executor::push_waker_and_get_token(
+                    monotonic_clock::subscribe_instant(deadline),
+                    context.waker().clone(),
+                ),
+            ));
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 async fn block_number(url: &str) -> anyhow::Result<u64> {

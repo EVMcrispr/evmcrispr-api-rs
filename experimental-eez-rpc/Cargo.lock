@@ -558,7 +558,9 @@ dependencies = [
  "alloy-rlp",
  "anyhow",
  "serde_json",
+ "spin-executor",
  "spin-sdk",
+ "wasi",
 ]
 
 [[package]]
