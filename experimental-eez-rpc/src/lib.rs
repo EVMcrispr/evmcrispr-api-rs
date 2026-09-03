@@ -19,6 +19,22 @@ const CROSS_CHAIN_GAS: &str = "0xaae60";
 /// execution RPC before handing it a cross-chain transaction.
 const FRONT_SYNC_MAX_SECS: u64 = 30;
 
+/// Errors that contracts raise around a call they made that reverted, keeping
+/// only the target and the calldata: the inner reason is dropped, so a
+/// cross-chain call wrapped in one of these no longer carries
+/// `ExecutionNotFound()`. Replaying the wrapped call is the only way to tell.
+/// `(selector, address word, bytes-offset word)`, indexed into the arguments.
+const CALL_WRAPPERS: [(&str, usize, usize); 3] = [
+    // Assertions `ERC8211.CallFailed(address target, bytes data)`
+    ("0x6c544f33", 0, 1),
+    // Assertions `Operators.RawCallFailed(address target, bytes data)`
+    ("0xf8ec3958", 0, 1),
+    // Assertions `Operators.LambdaCallFailed(uint256 index, address target, bytes callData)`
+    ("0x56573122", 1, 2),
+];
+/// How many wrappers to peel before giving up: each costs one `eth_call`.
+const MAX_UNWRAP_DEPTH: u8 = 3;
+
 const CORS_HEADERS: [(&str, &str); 4] = [
     ("access-control-allow-origin", "*"),
     ("access-control-allow-methods", "GET, POST, OPTIONS"),
@@ -63,6 +79,9 @@ fn chains() -> Vec<(String, Chain)> {
 /// - `eth_sendRawTransaction` whose `eth_call` simulation reverts with
 ///   `ExecutionNotFound()` → forwarded to the front (once its view has caught
 ///   up with the execution RPC); everything else → execution RPC verbatim.
+///
+/// Either revert also counts when it arrives wrapped in a caller's own error
+/// (see `CALL_WRAPPERS`), which is unwrapped and replayed to find out.
 #[http_component]
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
     if matches!(req.method(), Method::Options) {
@@ -123,18 +142,19 @@ async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
         // ExecutionNotFound before anything is signed. Declining it makes
         // clients fall back to eth_estimateGas & co., which we route.
         "eth_fillTransaction" => Ok(rpc_error(id, -32601, "Method not found")),
-        "eth_estimateGas" => Ok(estimate_gas(&chain, id, body).await),
+        "eth_estimateGas" => Ok(estimate_gas(&chain, id, &parsed, body).await),
         "eth_sendRawTransaction" => Ok(send_raw_transaction(&chain, id, &parsed, body).await),
         _ => Ok(forward(&chain.execution_rpc, body).await),
     }
 }
 
-async fn estimate_gas(chain: &Chain, id: Value, body: Vec<u8>) -> Response {
+async fn estimate_gas(chain: &Chain, id: Value, parsed: &Value, body: Vec<u8>) -> Response {
+    let from = parsed["params"][0]["from"].as_str().unwrap_or_default();
     let upstream = match rpc_post(&chain.execution_rpc, body).await {
         Ok(r) => r,
         Err(e) => return rpc_error(id, -32603, &format!("execution RPC unreachable: {e}")),
     };
-    if is_execution_not_found(&upstream) {
+    if is_cross_chain(chain, from, &upstream, 0).await {
         println!(
             "[{}] eth_estimateGas: cross-chain call, answering {CROSS_CHAIN_GAS}",
             chain.chain_id
@@ -165,7 +185,8 @@ async fn send_raw_transaction(chain: &Chain, id: Value, parsed: &Value, body: Ve
         Ok(r) => r,
         Err(e) => return rpc_error(id, -32603, &format!("execution RPC unreachable: {e}")),
     };
-    if !is_execution_not_found(&sim_resp) {
+    let from = call["from"].as_str().unwrap_or_default();
+    if !is_cross_chain(chain, from, &sim_resp, 0).await {
         println!(
             "[{}] eth_sendRawTransaction: ordinary tx from {}, forwarding to execution RPC",
             chain.chain_id, call["from"]
@@ -269,14 +290,74 @@ async fn block_number(url: &str) -> anyhow::Result<u64> {
     Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
 }
 
-/// Whether a JSON-RPC response carries an `ExecutionNotFound()` revert in
-/// `error.data` or `error.data.data`.
-fn is_execution_not_found(resp: &Value) -> bool {
+/// Revert data carried by a JSON-RPC error, in `error.data` or
+/// `error.data.data` depending on the node.
+fn revert_data(resp: &Value) -> Option<String> {
     let data = &resp["error"]["data"];
     [data, &data["data"]]
         .iter()
-        .filter_map(|d| d.as_str())
-        .any(|d| d.to_ascii_lowercase().starts_with(EXECUTION_NOT_FOUND))
+        .find_map(|d| d.as_str())
+        .map(str::to_ascii_lowercase)
+}
+
+/// Whether a probe reverted because the call is cross-chain: either
+/// `ExecutionNotFound()` itself, or a wrapper around a call that reverts with
+/// it. A wrapper keeps only the target and the calldata, so the wrapped call
+/// is replayed against the execution RPC to see what it really reverts with —
+/// up to `MAX_UNWRAP_DEPTH` layers, since wrappers nest.
+async fn is_cross_chain(chain: &Chain, from: &str, resp: &Value, depth: u8) -> bool {
+    let Some(data) = revert_data(resp) else {
+        return false;
+    };
+    if data.starts_with(EXECUTION_NOT_FOUND) {
+        return true;
+    }
+    if depth >= MAX_UNWRAP_DEPTH {
+        println!(
+            "[{}] stopped unwrapping after {depth} wrappers",
+            chain.chain_id
+        );
+        return false;
+    }
+    let Some((target, inner)) = unwrap_call(&data) else {
+        return false;
+    };
+    println!(
+        "[{}] revert wraps a call to {target}, replaying it to see why it failed",
+        chain.chain_id
+    );
+    let probe = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+        "params": [{"from": from, "to": target, "data": inner}, "latest"],
+    });
+    match rpc_json(&chain.execution_rpc, &probe).await {
+        // Boxed because the recursion makes this future's size unbounded.
+        Ok(inner_resp) => Box::pin(is_cross_chain(chain, from, &inner_resp, depth + 1)).await,
+        Err(e) => {
+            println!("[{}] replay of {target} failed: {e}", chain.chain_id);
+            false
+        }
+    }
+}
+
+/// Pull `(target, calldata)` out of one of the `CALL_WRAPPERS` errors.
+/// `None` when the data is not a wrapper we know or is malformed.
+fn unwrap_call(data: &str) -> Option<(String, String)> {
+    let bytes = hex::decode(data.trim_start_matches("0x")).ok()?;
+    let selector = hex::encode_prefixed(bytes.get(..4)?);
+    let (_, address_word, bytes_word) = CALL_WRAPPERS.iter().find(|(s, _, _)| *s == selector)?;
+    let args = &bytes[4..];
+    let word = |i: usize| args.get(i * 32..(i + 1) * 32);
+    // Only the low 4 bytes of an offset or length can be meaningful here: the
+    // whole payload is far smaller than 4GiB.
+    fn low_u32(word: &[u8]) -> Option<usize> {
+        Some(u32::from_be_bytes(word[28..32].try_into().ok()?) as usize)
+    }
+    let target = hex::encode_prefixed(&word(*address_word)?[12..]);
+    let offset = low_u32(word(*bytes_word)?)?;
+    let len = low_u32(args.get(offset..offset + 32)?)?;
+    let calldata = args.get(offset + 32..offset + 32 + len)?;
+    Some((target, hex::encode_prefixed(calldata)))
 }
 
 async fn rpc_json(url: &str, body: &Value) -> anyhow::Result<Value> {
