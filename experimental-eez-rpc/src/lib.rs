@@ -10,9 +10,12 @@ use std::future;
 use std::task::Poll;
 use wasi::clocks::monotonic_clock;
 
-/// Selector of the EEZ registry's `ExecutionNotFound()` error: what a
-/// cross-chain call reverts with when run outside a composed sync block.
-const EXECUTION_NOT_FOUND: &str = "0xed6bc750";
+/// Selectors of the EEZ registry errors a cross-chain call reverts with when
+/// run outside a composed sync block: `ExecutionNotFound()` (no entry for
+/// the call), and the block gate that fires before the lookup on either
+/// side — L1's `ExecutionNotInCurrentBlock(uint64 rollupId)` and L2's
+/// `ExecutionNotInCurrentBlock()`.
+const CROSS_CHAIN_REVERTS: [&str; 3] = ["0xed6bc750", "0x9a499f3b", "0xf9d330ad"];
 /// Gas limit reported for cross-chain calls (700000).
 const CROSS_CHAIN_GAS: &str = "0xaae60";
 /// How long to wait for the front's chain view to catch up with the
@@ -299,6 +302,12 @@ async fn block_number(url: &str) -> anyhow::Result<u64> {
     Ok(u64::from_str_radix(hex.trim_start_matches("0x"), 16)?)
 }
 
+/// Whether lowercase revert `data` is one of the registry errors that mean
+/// "this call only resolves inside a composed sync block".
+fn is_cross_chain_revert(data: &str) -> bool {
+    CROSS_CHAIN_REVERTS.iter().any(|s| data.starts_with(s))
+}
+
 /// Revert data carried by a JSON-RPC error, in `error.data` or
 /// `error.data.data` depending on the node.
 fn revert_data(resp: &Value) -> Option<String> {
@@ -310,8 +319,8 @@ fn revert_data(resp: &Value) -> Option<String> {
 }
 
 /// Whether `call` (an `eth_call` params object) reverted with `resp` because
-/// it is cross-chain: `ExecutionNotFound()` itself, a wrapper around a call
-/// that reverts with it, or a Safe `execTransaction` whose inner call does.
+/// it is cross-chain: one of `CROSS_CHAIN_REVERTS` itself, a wrapper around a
+/// call that reverts with one, or a Safe `execTransaction` whose inner call does.
 /// A wrapper keeps only the target and the calldata, and a Safe keeps
 /// nothing at all, so the inner call is replayed against the execution RPC
 /// to see what it really reverts with — up to `MAX_UNWRAP_DEPTH` layers,
@@ -320,7 +329,7 @@ async fn is_cross_chain(chain: &Chain, call: &Value, resp: &Value, depth: u8) ->
     let Some(data) = revert_data(resp) else {
         return false;
     };
-    if data.starts_with(EXECUTION_NOT_FOUND) {
+    if is_cross_chain_revert(&data) {
         return true;
     }
     if depth >= MAX_UNWRAP_DEPTH {
@@ -575,6 +584,18 @@ mod tests {
         assert_eq!(value, "0x7");
         assert_eq!(inner, "0x0ce105e2");
         assert_eq!(operation, 0);
+    }
+
+    #[test]
+    fn recognises_every_registry_gate_as_cross_chain() {
+        // ExecutionNotFound()
+        assert!(is_cross_chain_revert("0xed6bc750"));
+        // L1 ExecutionNotInCurrentBlock(uint64 rollupId)
+        assert!(is_cross_chain_revert(&format!("0x9a499f3b{}", word("1"))));
+        // L2 ExecutionNotInCurrentBlock()
+        assert!(is_cross_chain_revert("0xf9d330ad"));
+        // Something else that reverted for its own reasons
+        assert!(!is_cross_chain_revert("0x08c379a0"));
     }
 
     #[test]
